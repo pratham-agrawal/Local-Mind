@@ -1,11 +1,13 @@
-from chatbot import run_chat
+from chatbot import AccountabilityAI
 from database import Database
 
 def main():
+    ai = AccountabilityAI()  # Initialize the AI once
+    
     while True:
         choice = input("\n(1) Chat  (2) Add Goal  (q) Quit: ")
         if choice == "1":
-            run_chat()
+            ai.run_chat()
         elif choice == "2":
             name = input("Goal name: ")
             desc = input("Goal description: ")
