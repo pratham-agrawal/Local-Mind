@@ -2,13 +2,14 @@ from database import Database
 import os
 from dotenv import load_dotenv
 import google.generativeai as genai
+from datetime import datetime
+from typing import List, Dict, Any
 
 class AccountabilityAI:
-    def __init__(self):
+    def __init__(self, db_path: str = "accountability.db"):
         """
-        Initialize the AI with environment configuration and system prompt.
+        Initialize the accountability coach with API configuration and loads user's goals and conversation history.
         """
-        # Load and configure API key
         load_dotenv()
         api_key = os.getenv('GEMINI_API_KEY')
         if not api_key:
@@ -16,9 +17,13 @@ class AccountabilityAI:
         
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel('gemini-2.0-flash')
-        self.db = Database()
-        self.messages = []
-        
+        self.db = Database(db_path)
+
+        with self.db as db:
+            recent = db.get_uncleaned_logs(limit=50)
+            self.messages: List[Dict[str, Any]] = recent[:]
+            self.goals = db.get_goals()
+
         self.system_prompt = """
         You are AccountabilityAI — a data-driven productivity coach and advisor.
         Your role is to help the user stay on track with their goals, reflect honestly on their progress, and diagnose the root causes of procrastination or avoidance when a pattern becomes clear. You are not a generic assistant; you are a coach that balances unflinching honesty with practical, adaptive solutions.
@@ -42,42 +47,66 @@ class AccountabilityAI:
         Not artificially positive or "rah-rah."
         Supportive, but not indulgent — you challenge the user when they avoid responsibility.
         Conversational and personal, but concise — avoid long essays unless diagnosing a deeper pattern.
-
-        Example style:
-        User: "I'll start the report tomorrow."
-        AI: "You've delayed this twice already. What's blocking you? At the rate we're going you won't be able to stay on track for your goal.
         """
 
     def call_ai_model(self, prompt: str) -> str:
         """
-        Make an API call to Google's Gemini AI model.
+        Generate response using Gemini AI model with the given prompt.
         """
-        response = self.model.generate_content(prompt)
-        return response.text
+        try:
+            response = self.model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            raise Exception(f"Error generating response: {str(e)}")
+
+    def _make_timestamp(self) -> str:
+        """Generate current UTC timestamp for message tracking."""
+        return datetime.utcnow().isoformat()
 
     def generate_reply(self, user_message: str) -> str:
         """
-        Generate a reply to the user's message using context from the database.
+        Generate a coaching response considering user's goals, progress history, and recent conversations.
+        Stores both user messages and AI responses for continuous progress tracking.
         """
-        # Add user message to conversation history
-        self.messages.append({"role": "user", "content": user_message})
-        
-        # Get context from database
+        ts_user = self._make_timestamp()
         with self.db as db:
             goals = db.get_goals()
             cleaned_logs = db.get_cleaned_logs()
-            recent_logs = db.get_uncleaned_logs(limit=25)
-            db.add_uncleaned_log(user_message)
+            db.add_message("user", user_message, ts_user)
 
-        # Build the prompt
-        context = f"Goals:\n{goals}\n\nPast Activities:\n{cleaned_logs}\n\nRecent Activities:\n{recent_logs}"
-        conversation = "\n".join([f"{msg['role']}: {msg['content']}" for msg in self.messages])
-        full_prompt = f"{self.system_prompt}\n\nContext:\n{context}\n\nConversation:\n{conversation}\n\nAssistant:"
-        
-        # Get and store AI's reply
+        self.messages.append({"role": "user", "content": user_message, "timestamp": ts_user})
+
+        # Format goals and progress history for AI context
+        goals_text = ""
+        for g in goals:
+            goals_text += f"- {g['name']}: {g['description']}\n"
+
+        cleaned_text = ""
+        for c in cleaned_logs:
+            cleaned_text += f"- (goal_id={c['goal_id']}) {c['date']}: {c['summary']}\n"
+
+        convo_text = ""
+        for m in self.messages[-50:]:
+            convo_text += f"[{m.get('timestamp','')}] {m['role']}: {m['content']}\n"
+
+        full_prompt = (
+            f"{self.system_prompt}\n\n"
+            f"Context - Goals:\n{goals_text}\n"
+            f"Context - Cleaned Logs:\n{cleaned_text}\n"
+            f"Recent Conversation:\n{convo_text}\n\n"
+            "Assistant:"
+        )
+
+        # Call model
         reply = self.call_ai_model(full_prompt)
-        self.messages.append({"role": "assistant", "content": reply})
-        
+
+        # Persist assistant reply with timestamp and append to memory
+        ts_ai = self._make_timestamp()
+        with self.db as db:
+            db.add_message("assistant", reply, ts_ai)
+
+        self.messages.append({"role": "assistant", "content": reply, "timestamp": ts_ai})
+
         return reply
 
     def run_chat(self):
@@ -91,5 +120,11 @@ class AccountabilityAI:
             if user_input.lower() in ["quit", "exit", "q"]:
                 break
 
-            reply = self.generate_reply(user_input)
-            print("AI:", reply)
+            try:
+                reply = self.generate_reply(user_input)
+                print("AI:", reply)
+            except Exception as e:
+                print(f"\nError: {str(e)}")
+                print("Please try again in a moment.")
+                break
+
