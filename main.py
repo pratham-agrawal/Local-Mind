@@ -14,7 +14,7 @@ def main():
             with Database() as db:
                 db.add_goal(name, desc)
             print("✅ Goal added")
-        elif choice.lower() == "q":
+        elif choice.lower() == "q" or choice.lower() == "quit":
             break
         else:
             print("Invalid choice.")

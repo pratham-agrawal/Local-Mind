@@ -2,8 +2,15 @@ from database import Database
 import os
 from dotenv import load_dotenv
 import google.generativeai as genai
-from datetime import datetime
-from typing import List, Dict, Any
+from datetime import datetime, date, time, timedelta
+from typing import List, Dict, Any, Optional
+import json
+
+# Remove timestamps from here, fill them in the DB directly when adding messages
+# Add AI prompt to iterate on goal so that GOAL is SMART.
+# stop backfilling at startup, trigger on close of chat?
+# option to delete goals
+# 
 
 class AccountabilityAI:
     def __init__(self, db_path: str = "accountability.db"):
@@ -16,7 +23,7 @@ class AccountabilityAI:
             raise ValueError("GEMINI_API_KEY not found in environment variables")
         
         genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-2.0-flash')
+        self.model = genai.GenerativeModel('gemini-2.5-flash')
         self.db = Database(db_path)
 
         with self.db as db:
@@ -48,6 +55,7 @@ class AccountabilityAI:
         Supportive, but not indulgent — you challenge the user when they avoid responsibility.
         Conversational and personal, but concise — avoid long essays unless diagnosing a deeper pattern.
         """
+        self.backfill_cleaned_logs(cutoff_hour=4)
 
     def call_ai_model(self, prompt: str) -> str:
         """
@@ -128,3 +136,139 @@ class AccountabilityAI:
                 print("Please try again in a moment.")
                 break
 
+    def _day_start_from_timestamp(self, ts: str, cutoff_hour: int = 4) -> date:
+        """
+        Convert an ISO timestamp string to the 'day_start' date according to cutoff_hour.
+        E.g., cutoff_hour=4 means day runs from 04:01 of day D -> 04:00 of day D+1.
+        Returns the date D as a date() object.
+        """
+        dt = datetime.fromisoformat(ts)
+        # If time is before or equal to cutoff_hour:00 (i.e., 04:00), attribute it to previous logical day
+        cutoff = time(hour=cutoff_hour, minute=0, second=0)
+        if dt.time() <= cutoff:
+            # belongs to previous day
+            return (dt.date() - timedelta(days=1))
+        return dt.date()
+
+    def _day_window_iso(self, day_start: date, cutoff_hour: int = 4) -> (str, str):
+        """
+        Given a day_start date D, return (start_iso, end_iso) for that day's activity window:
+        start = D at 04:00:01 UTC (inclusive),
+        end = (D + 1 day) at 04:00:01 UTC (exclusive).
+        Using .isoformat() strings for DB queries.
+        """
+        # define start at D @ 04:00:00 (we'll include >= start and < end)
+        start_dt = datetime.combine(day_start, time(hour=cutoff_hour, minute=0, second=0))
+        end_dt = start_dt + timedelta(days=1)
+        # Use ISO format (no timezone)
+        return (start_dt.isoformat(), end_dt.isoformat())
+
+    def summarize_logs_for_day(self, logs: List[Dict[str, Any]], goals: List[Dict[str, Any]], day_start: date) -> List[Dict[str, Any]]:
+        """
+        Ask the LLM to summarize a day's raw logs into per-goal cleaned summaries.
+        Returns a list of dicts: [{"goal_id": <id or None>, "summary": "<text>"}, ...]
+        - For each goal in `goals`, the model should produce a short summary (or an empty string).
+        - If the model can't return structured JSON, we fallback to a general summary with goal_id=None.
+        """
+        # Build a compact prompt: provide goals and the day's messages, ask for JSON output.
+        goals_text = "\n".join([f"{g['id']}: {g['name']} - {g['description']}" for g in goals]) if goals else "[]"
+        logs_text = "\n".join([f"[{l['timestamp']}] {l['role']}: {l['content']}" for l in logs])
+
+        prompt = (
+            f"You are a summarization assistant. For the date {day_start.isoformat()}, given the user's goals and "
+            f"the day's raw conversation logs, produce a JSON array of objects mapping goal_id -> concise summary "
+            f"for that goal's progress that day. If no progress for a goal, provide an empty string for summary.\n\n"
+            f"Goals (id: name - desc):\n{goals_text}\n\n"
+            f"Raw logs:\n{logs_text}\n\n"
+            "Return EXACTLY valid JSON like: "
+            '[{"goal_id": 1, "summary": "Did work on X"}, {"goal_id": 2, "summary": ""}, {"goal_id": null, "summary": "General notes..."}]\n'
+            "Include at least one object with goal_id === null for any general, non-goal-specific notes if appropriate."
+        )
+
+        # Call LLM (use your existing wrapper)
+        try:
+            raw = self.call_ai_model(prompt)
+        except Exception as e:
+            # On failure, fallback to a single general summary
+            general = "Failed to generate structured summary: " + str(e)
+            return [{"goal_id": None, "summary": general}]
+
+        # Attempt to parse JSON from the model's output
+        parsed = None
+        # Try to locate first JSON substring if the model prepends commentary
+        try:
+            # sanitize and extract JSON
+            start = raw.find("[")
+            end = raw.rfind("]") + 1
+            if start != -1 and end != -1 and end > start:
+                json_text = raw[start:end]
+                parsed = json.loads(json_text)
+        except Exception:
+            parsed = None
+
+        if isinstance(parsed, list):
+            # normalize items
+            results = []
+            for item in parsed:
+                # accept keys 'goal_id' and 'summary' or fallbacks
+                gid = item.get("goal_id") if isinstance(item, dict) else None
+                summ = item.get("summary") if isinstance(item, dict) else str(item)
+                results.append({"goal_id": gid, "summary": summ})
+            return results
+
+        # fallback: create a single general summary using raw as content
+        return [{"goal_id": None, "summary": raw.strip()}]
+
+    def backfill_cleaned_logs(self, cutoff_hour: int = 4) -> List[Dict[str, Any]]:
+        """
+        Backfill missing cleaned logs from the DB using lazy summarization.
+        Workflow:
+          - Determine earliest uncleaned log and latest cleaned day.
+          - Compute list of day_start dates to ensure are covered (for days that have logs).
+          - For each missing day, fetch raw logs between start/end; if logs exist, summarize and insert cleaned rows.
+          - If no logs exist for that day, optionally insert a 'no activity' cleaned row with goal_id=None (skip if you prefer).
+        Returns a list of inserted cleaned-log metadata.
+        """
+        inserted = []
+        with self.db as db:
+            # earliest raw log timestamp (iso) and latest cleaned day (YYYY-MM-DD)
+            earliest_iso = db.get_earliest_uncleaned_timestamp()
+            latest_cleaned_day = db.get_latest_cleaned_day()  # string YYYY-MM-DD or None
+
+            if not earliest_iso:
+                return inserted  # nothing to do
+
+            # Compute start and end range
+            first_day = self._day_start_from_timestamp(earliest_iso, cutoff_hour=cutoff_hour)
+            if latest_cleaned_day:
+                start_day = datetime.fromisoformat(latest_cleaned_day).date() + timedelta(days=1)
+            else:
+                start_day = first_day
+
+            now_iso = datetime.utcnow().isoformat()
+            last_day = self._day_start_from_timestamp(now_iso, cutoff_hour=cutoff_hour)
+
+            # Process each day within the database context
+            day = start_day
+            while day <= last_day:
+                start_iso, end_iso = self._day_window_iso(day, cutoff_hour=cutoff_hour)
+                logs = db.get_uncleaned_logs_between(start_iso, end_iso)
+                
+                if logs:
+                    goals = db.get_goals()
+                    summaries = self.summarize_logs_for_day(logs, goals, day)
+                    
+                    for s in summaries:
+                        gid = s.get("goal_id")
+                        summary_text = s.get("summary", "").strip()
+                        
+                        if summary_text == "":
+                            db.add_cleaned_log(gid, "(no progress noted)", date=day.isoformat())
+                            inserted.append({"day": day.isoformat(), "goal_id": gid, "summary": "(no progress noted)"})
+                        else:
+                            db.add_cleaned_log(gid, summary_text, date=day.isoformat())
+                            inserted.append({"day": day.isoformat(), "goal_id": gid, "summary": summary_text})
+                
+                day = day + timedelta(days=1)
+
+        return inserted
