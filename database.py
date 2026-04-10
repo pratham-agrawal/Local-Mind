@@ -1,6 +1,10 @@
 import sqlite3
 from datetime import datetime
 from typing import List, Dict, Optional
+from datetime import datetime
+from typing import List, Dict, Optional, Any
+
+
 
 class Database:
     def __init__(self, db_path="accountability.db"):
@@ -97,13 +101,6 @@ class Database:
         return messages
 
     # ---- Cleaned logs ----
-    def add_cleaned_log(self, goal_id: int, summary: str):
-        cur = self.conn.cursor()
-        cur.execute(
-            "INSERT INTO logs_cleaned (goal_id, summary) VALUES (?, ?)",
-            (goal_id, summary)
-        )
-
     def get_cleaned_logs(self, goal_id: int = None):
         cur = self.conn.cursor()
         if goal_id:
@@ -112,3 +109,51 @@ class Database:
             cur.execute("SELECT id, goal_id, summary, date FROM logs_cleaned ORDER BY date DESC")
         rows = cur.fetchall()
         return [{"id": r["id"], "goal_id": r["goal_id"], "summary": r["summary"], "date": r["date"]} for r in rows]
+    
+    def get_uncleaned_logs_between(self, start_iso: str, end_iso: str) -> List[Dict[str, Any]]:
+        """
+        Return uncleaned logs (conversation rows) between two ISO timestamps (inclusive start, exclusive end).
+        Each row: {"role": ..., "content": ..., "timestamp": ...}
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT role, message, created_at FROM logs_uncleaned WHERE created_at >= ? AND created_at < ? ORDER BY id ASC",
+            (start_iso, end_iso)
+        )
+        rows = cur.fetchall()
+        return [{"role": r["role"], "content": r["message"], "timestamp": r["created_at"]} for r in rows]
+
+    def get_earliest_uncleaned_timestamp(self) -> Optional[str]:
+        """
+        Return the earliest created_at ISO timestamp in logs_uncleaned, or None if no logs.
+        """
+        cur = self.conn.cursor()
+        cur.execute("SELECT created_at FROM logs_uncleaned ORDER BY id ASC LIMIT 1")
+        row = cur.fetchone()
+        return row["created_at"] if row else None
+
+    def get_latest_cleaned_day(self) -> Optional[str]:
+        """
+        Return the latest `date` value stored in logs_cleaned as ISO date string (YYYY-MM-DD),
+        or None if no cleaned logs exist.
+        """
+        cur = self.conn.cursor()
+        cur.execute("SELECT date FROM logs_cleaned ORDER BY date DESC LIMIT 1")
+        row = cur.fetchone()
+        return row["date"] if row else None
+
+    def add_cleaned_log(self, goal_id: Optional[int], summary: str, date: Optional[str] = None) -> int:
+        """
+        Insert a cleaned log. goal_id may be None (for general daily summaries).
+        date should be a YYYY-MM-DD string representing the day_start per your cutoff.
+        Returns lastrowid.
+        """
+        if date is None:
+            date = datetime.utcnow().date().isoformat()
+        cur = self.conn.cursor()
+        cur.execute(
+            "INSERT INTO logs_cleaned (goal_id, summary, date) VALUES (?, ?, ?)",
+            (goal_id, summary, date)
+        )
+        self.conn.commit()
+        return cur.lastrowid
